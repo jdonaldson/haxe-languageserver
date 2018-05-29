@@ -14,18 +14,19 @@ import jsonrpc.CancellationToken;
 import haxeLanguageServer.helper.SemVer;
 import haxeLanguageServer.protocol.Server.ServerMethods;
 import haxeLanguageServer.protocol.Protocol;
+import haxeLanguageServer.server.transport.Transport;
+import haxeLanguageServer.server.transport.StdioTransport;
 
 class HaxeServer {
     final context:Context;
 
     var proc:ChildProcessObject;
-    var buffer:MessageBuffer;
-    var nextMessageLength:Int;
+    var transport:Transport;
 
     var requestsHead:DisplayRequest;
     var requestsTail:DisplayRequest;
     var currentRequest:DisplayRequest;
-    var socketListener:js.node.net.Server;
+    var socketListener:Server;
     var stopProgressCallback:Void->Void;
     var startRequest:Void->Void;
 
@@ -87,15 +88,13 @@ class HaxeServer {
         if (!isVersionSupported)
             return error('Unsupported Haxe version! Minimum required: 3.4.0. Found: $version.');
 
-        buffer = new MessageBuffer();
-        nextMessageLength = -1;
-
         proc = ChildProcess.spawn(context.displayServerConfig.path, context.displayServerConfig.arguments.concat(["--wait", "stdio"]), {env: env});
+
+        transport = new StdioTransport(proc.stdin, proc.stderr, onData);
 
         proc.stdout.on(ReadableEvent.Data, function(buf:Buffer) {
             context.sendLogMessage(Log, reTrailingNewline.replace(buf.toString(), ""));
         });
-        proc.stderr.on(ReadableEvent.Data, onData);
         proc.on(ChildProcessEvent.Exit, onExit);
 
         capabilities = {
@@ -286,7 +285,8 @@ class HaxeServer {
             return;
         }
 
-        var haxeResponse = buffer.getContent();
+        // FIXME: meh
+        var haxeResponse = @:privateAccess Std.instance(transport,StdioTransport).buffer.getContent();
 
         // invalid compiler argument?
         var invalidOptionRegex = ~/unknown option `(.*?)'./;
@@ -302,25 +302,12 @@ class HaxeServer {
         trace(haxeResponse);
     }
 
-    function onData(data:Buffer) {
-        buffer.append(data);
-        while (true) {
-            if (nextMessageLength == -1) {
-                var length = buffer.tryReadLength();
-                if (length == -1)
-                    return;
-                nextMessageLength = length;
-            }
-            var msg = buffer.tryReadContent(nextMessageLength);
-            if (msg == null)
-                return;
-            nextMessageLength = -1;
-            if (currentRequest != null) {
-                var request = currentRequest;
-                currentRequest = null;
-                request.onData(msg);
-                checkQueue();
-            }
+    function onData(msg:String) {
+        if (currentRequest != null) {
+            var request = currentRequest;
+            currentRequest = null;
+            request.onData(msg);
+            checkQueue();
         }
     }
 
@@ -377,7 +364,7 @@ class HaxeServer {
         if (requestsHead != null) {
             currentRequest = requestsHead;
             requestsHead = currentRequest.next;
-            proc.stdin.write(currentRequest.prepareBody());
+            transport.sendRequest(currentRequest);
         }
     }
 }
